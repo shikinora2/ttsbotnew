@@ -233,23 +233,62 @@ async def slash_help(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------
-# 4. XỬ LÝ KHI BOT BỊ KICK KHỎI VOICE CHANNEL
+# 4. XỬ LÝ KHI CÓ THAY ĐỔI TRẠNG THÁI VOICE
 # ---------------------------------------------------------
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Reset state khi bot bị kick/tự disconnect ngoài lệnh /leave"""
-    if bot.user is None or member.id != bot.user.id:
+    if bot.user is None:
         return
-    # Bot vừa rời khỏi một voice channel
-    if before.channel is not None and after.channel is None:
-        guild_id = before.channel.guild.id
-        state = get_state(guild_id)
+
+    # --- Trường hợp 1: chính bot bị kick / disconnect ngoài /leave ---
+    if member.id == bot.user.id:
+        if before.channel is not None and after.channel is None:
+            guild_id = before.channel.guild.id
+            state = get_state(guild_id)
+            if state.play_task and not state.play_task.done():
+                state.play_task.cancel()
+            state.play_task = None
+            state.queue = asyncio.Queue()
+            state.setup_channel_id = None
+            print(f"[Info] Bot bị ngắt khỏi voice — đã reset state guild {guild_id}")
+        return
+
+    # --- Trường hợp 2: một thành viên rời kênh mà bot đang ở ---
+    guild = before.channel.guild if before.channel else None
+    if guild is None:
+        return
+
+    vc = guild.voice_client
+    if vc is None:
+        return
+
+    bot_channel = vc.channel
+    # Kiểm tra xem người vừa rời có ở kênh bot đang đứng không
+    if before.channel != bot_channel:
+        return
+
+    # Đếm số thành viên thật (không tính bot) còn lại trong kênh
+    human_members = [m for m in bot_channel.members if not m.bot]
+    if len(human_members) == 0:
+        state = get_state(guild.id)
+        # Thông báo vào kênh chat đã setup (nếu còn)
+        if state.setup_channel_id:
+            ch = guild.get_channel(state.setup_channel_id)
+            if ch:
+                await ch.send("👋 Kênh thoại trống — bot tự rời để tiết kiệm tài nguyên.")  # type: ignore[union-attr]
+
         if state.play_task and not state.play_task.done():
             state.play_task.cancel()
+            try:
+                await state.play_task
+            except asyncio.CancelledError:
+                pass
         state.play_task = None
         state.queue = asyncio.Queue()
         state.setup_channel_id = None
-        print(f"[Info] Bot bị ngắt khỏi voice — đã reset state guild {guild_id}")
+
+        await vc.disconnect(force=False)  # type: ignore[union-attr]
+        print(f"[Info] Kênh trống — bot tự rời guild {guild.id}")
 
 
 # ---------------------------------------------------------
