@@ -1,0 +1,17 @@
+# Thông tin bí mật — KHÔNG đẩy lên Git
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+*.egg-info/
+
+# File audio tạm
+temp_audio_*.mp3
+pipeline_*.mp3
+test_audio_*.mp3
+
+# OS
+.DS_Store
+Thumbs.db
