@@ -23,7 +23,7 @@ intents.message_content = True
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
-    application_id=int(DISCORD_APP_ID) if DISCORD_APP_ID else None
+    application_id=int(DISCORD_APP_ID) if DISCORD_APP_ID else discord.utils.MISSING
 )
 
 # Khóa luồng (Lock) để đảm bảo tại 1 thời điểm chỉ có 1 tiến trình gen audio
@@ -61,6 +61,7 @@ def generate_audio_sync(text, filepath):
 async def tts_worker(voice_client, state):
     """Tiến trình ngầm chạy liên tục để kiểm tra hàng đợi và phát âm thanh"""
     while True:
+        filepath = None
         try:
             text = await state.queue.get()
 
@@ -68,10 +69,20 @@ async def tts_worker(voice_client, state):
                 state.queue.task_done()
                 continue
 
+            # Dừng nếu bot đã bị ngắt kết nối
+            if not voice_client.is_connected():
+                state.queue.task_done()
+                break
+
             filepath = f"temp_audio_{uuid.uuid4().hex}.mp3"
 
             async with tts_lock:
                 await asyncio.to_thread(generate_audio_sync, text, filepath)
+
+            # Kiểm tra lại sau khi sinh audio (bot có thể bị kick trong lúc chờ)
+            if not voice_client.is_connected():
+                state.queue.task_done()
+                break
 
             while voice_client.is_playing():
                 await asyncio.sleep(0.5)
@@ -83,15 +94,20 @@ async def tts_worker(voice_client, state):
                 while voice_client.is_playing():
                     await asyncio.sleep(0.1)
 
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-
             state.queue.task_done()
 
         except asyncio.CancelledError:
             break
         except Exception as e:
             print(f"[Lỗi Playback] {e}")
+            try:
+                state.queue.task_done()
+            except Exception:
+                pass
+        finally:
+            # Luôn dọn file tạm dù thành công hay lỗi
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
 
 # ---------------------------------------------------------
 # 3. SLASH COMMANDS
@@ -99,54 +115,89 @@ async def tts_worker(voice_client, state):
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"Đã đăng nhập thành công: {bot.user.name}")
+    user = bot.user
+    print(f"Đã đăng nhập thành công: {user.name if user else 'unknown'}")
     print("Slash commands đã được đồng bộ.")
     await bot.change_presence(activity=discord.Game(name="/join | /leave | /help"))
 
 
 @bot.tree.command(name="join", description="Bot vào kênh thoại bạn đang đứng và đọc tin nhắn từ kênh này")
+@app_commands.guild_only()
 async def slash_join(interaction: discord.Interaction):
-    state = get_state(interaction.guild.id)
+    guild: discord.Guild = interaction.guild  # type: ignore[assignment]
+    member: discord.Member = interaction.user  # type: ignore[assignment]
+    channel: discord.TextChannel = interaction.channel  # type: ignore[assignment]
+    state = get_state(guild.id)
 
-    if interaction.user.voice is None:
+    if member.voice is None:
         await interaction.response.send_message(
             "⚠️ Bạn phải vào một kênh thoại (Voice Channel) trước!", ephemeral=True
         )
         return
 
-    voice_channel = interaction.user.voice.channel
+    voice_channel: discord.VoiceChannel = member.voice.channel  # type: ignore[assignment]
 
-    if interaction.guild.voice_client is not None:
-        await interaction.guild.voice_client.move_to(voice_channel)
-        voice_client = interaction.guild.voice_client
+    # Chặn cướp bot: nếu bot đang hoạt động, chỉ người trong cùng voice channel mới được điều khiển
+    if guild.voice_client is not None and state.setup_channel_id is not None:
+        current_vc: discord.VoiceClient = guild.voice_client  # type: ignore[assignment]
+        if voice_channel.id != current_vc.channel.id:  # type: ignore[union-attr]
+            await interaction.response.send_message(
+                f"⛔ Bot đang bận phục vụ kênh **{current_vc.channel.name}**.\n"  # type: ignore[union-attr]
+                f"Vào kênh đó hoặc dùng `/leave` để giải phóng bot trước.",
+                ephemeral=True
+            )
+            return
+
+    if guild.voice_client is not None:
+        vc: discord.VoiceClient = guild.voice_client  # type: ignore[assignment]
+        await vc.move_to(voice_channel)
     else:
-        voice_client = await voice_channel.connect()
+        vc = await voice_channel.connect()  # type: ignore[assignment]
 
-    # Kênh chat nơi user gõ /join chính là kênh TTS
-    state.setup_channel_id = interaction.channel.id
+    # Hủy task cũ (kể cả khi bot bị kick trước đó mà task vẫn còn zombie)
+    if state.play_task and not state.play_task.done():
+        state.play_task.cancel()
+        try:
+            await state.play_task
+        except asyncio.CancelledError:
+            pass
+    state.play_task = None
 
-    if state.play_task is None or state.play_task.done():
-        state.play_task = bot.loop.create_task(tts_worker(voice_client, state))
+    # Xóa queue cũ để không đọc tin nhắn từ kênh/session trước
+    state.queue = asyncio.Queue()
+
+    # Cập nhật kênh chat TTS = kênh nơi user gõ /join
+    state.setup_channel_id = channel.id
+
+    # Tạo worker mới với voice_client hiện tại
+    state.play_task = bot.loop.create_task(tts_worker(vc, state))
 
     await interaction.response.send_message(
         f"👋 Đã tham gia **{voice_channel.name}**.\n"
-        f"📢 Đang lắng nghe kênh **{interaction.channel.name}** — hãy chat để bot đọc!"
+        f"📢 Đang lắng nghe kênh **{channel.name}** — hãy chat để bot đọc!"
     )
 
 
 @bot.tree.command(name="leave", description="Bot rời kênh thoại và xóa hàng đợi")
+@app_commands.guild_only()
 async def slash_leave(interaction: discord.Interaction):
-    state = get_state(interaction.guild.id)
+    guild: discord.Guild = interaction.guild  # type: ignore[assignment]
+    state = get_state(guild.id)
 
-    if interaction.guild.voice_client:
-        if state.play_task:
+    if guild.voice_client:
+        vc: discord.VoiceClient = guild.voice_client  # type: ignore[assignment]
+        if state.play_task and not state.play_task.done():
             state.play_task.cancel()
-            state.play_task = None
+            try:
+                await state.play_task
+            except asyncio.CancelledError:
+                pass
+        state.play_task = None
 
         state.queue = asyncio.Queue()
         state.setup_channel_id = None
 
-        await interaction.guild.voice_client.disconnect()
+        await vc.disconnect(force=False)
         await interaction.response.send_message("🛑 Đã rời kênh thoại và xóa hàng đợi.")
     else:
         await interaction.response.send_message(
@@ -155,6 +206,7 @@ async def slash_leave(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="help", description="Hiển thị danh sách lệnh của bot")
+@app_commands.guild_only()
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="📖 Hướng dẫn dùng TTS Bot",
@@ -181,7 +233,27 @@ async def slash_help(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------
-# 4. LẮNG NGHE TIN NHẮN (MESSAGE EVENT)
+# 4. XỬ LÝ KHI BOT BỊ KICK KHỎI VOICE CHANNEL
+# ---------------------------------------------------------
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Reset state khi bot bị kick/tự disconnect ngoài lệnh /leave"""
+    if bot.user is None or member.id != bot.user.id:
+        return
+    # Bot vừa rời khỏi một voice channel
+    if before.channel is not None and after.channel is None:
+        guild_id = before.channel.guild.id
+        state = get_state(guild_id)
+        if state.play_task and not state.play_task.done():
+            state.play_task.cancel()
+        state.play_task = None
+        state.queue = asyncio.Queue()
+        state.setup_channel_id = None
+        print(f"[Info] Bot bị ngắt khỏi voice — đã reset state guild {guild_id}")
+
+
+# ---------------------------------------------------------
+# 5. LẮNG NGHE TIN NHẮN (MESSAGE EVENT)
 # ---------------------------------------------------------
 @bot.event
 async def on_message(message):
