@@ -1,5 +1,8 @@
-# Thông tin bí mật — KHÔNG đẩy lên Git
+# Thong tin bi mat - KHONG day len Git
 .env
+.env.bot1
+.env.bot2
+.env.bot3
 
 # Python
 __pycache__/
